@@ -1,0 +1,200 @@
+#!/usr/bin/env python3
+"""
+GitHub repository searcher for keywords (e.g. "software" and "app").
+
+Features:
+- Uses GitHub Search API (recommended) instead of scraping HTML.
+- Supports matching ANY (OR) or ALL (AND) of the keywords.
+- Pagination, rate-limit handling (uses X-RateLimit-* headers).
+- Optional per-repo topics fetching.
+- Export results to JSON or CSV.
+- Use GITHUB_TOKEN env var to increase rate limits (recommended).
+"""
+import os
+import sys
+import time
+import argparse
+import requests
+import json
+import csv
+
+GITHUB_API = "https://api.github.com"
+
+def get_auth_headers(token):
+    headers = {
+        "Accept": "application/vnd.github.v3+json",
+        "User-Agent": "github-keyword-scraper/1.0",
+    }
+    if token:
+        headers["Authorization"] = f"token {token}"
+    return headers
+
+def build_query(keywords, match_any=False, in_fields=None, qualifiers=None):
+    # keywords: list of strings
+    if match_any:
+        core = " OR ".join(k for k in keywords)
+    else:
+        core = " ".join(k for k in keywords)
+    parts = [core]
+    if in_fields:
+        parts.append(f"in:{','.join(in_fields)}")
+    if qualifiers:
+        parts.extend(qualifiers)
+    return " ".join(parts)
+
+def handle_rate_limit(resp):
+    # If we're rate-limited, resp.status_code is likely 403.
+    remaining = resp.headers.get("X-RateLimit-Remaining")
+    reset = resp.headers.get("X-RateLimit-Reset")
+    try:
+        remaining = int(remaining) if remaining is not None else None
+    except:
+        remaining = None
+    try:
+        reset = int(reset) if reset is not None else None
+    except:
+        reset = None
+
+    if remaining == 0 and reset:
+        sleep_secs = max(0, reset - int(time.time()) + 5)
+        print(f"Rate limit reached. Sleeping for {sleep_secs} seconds until reset...", file=sys.stderr)
+        time.sleep(sleep_secs)
+        return True
+    return False
+
+def search_repositories(query, headers, sort=None, order="desc", per_page=100, max_pages=10, fetch_topics=False):
+    results = []
+    session = requests.Session()
+    page = 1
+    while page <= max_pages:
+        params = {
+            "q": query,
+            "per_page": per_page,
+            "page": page,
+        }
+        if sort:
+            params["sort"] = sort
+            params["order"] = order
+        url = f"{GITHUB_API}/search/repositories"
+        resp = session.get(url, headers=headers, params=params)
+        if resp.status_code == 200:
+            data = resp.json()
+            items = data.get("items", [])
+            if not items:
+                break
+            for it in items:
+                repo = {
+                    "id": it.get("id"),
+                    "full_name": it.get("full_name"),
+                    "html_url": it.get("html_url"),
+                    "description": it.get("description"),
+                    "stargazers_count": it.get("stargazers_count"),
+                    "watchers_count": it.get("watchers_count"),
+                    "forks_count": it.get("forks_count"),
+                    "open_issues_count": it.get("open_issues_count"),
+                    "language": it.get("language"),
+                    "created_at": it.get("created_at"),
+                    "updated_at": it.get("updated_at"),
+                    "pushed_at": it.get("pushed_at"),
+                    "topics": it.get("topics", []),  # may be empty depending on accept header
+                }
+                results.append(repo)
+            # Search API caps results to first 1000 matches; break if reached.
+            total_count = data.get("total_count", 0)
+            fetched = len(results)
+            if fetched >= 1000 or fetched >= total_count:
+                break
+            page += 1
+            # gentle sleep to avoid hitting secondary limits
+            time.sleep(0.5)
+        elif resp.status_code == 403:
+            if handle_rate_limit(resp):
+                continue
+            else:
+                print("403 Forbidden received but not rate-limit response. Exiting.", file=sys.stderr)
+                print(resp.text, file=sys.stderr)
+                break
+        else:
+            print(f"Unexpected status {resp.status_code}: {resp.text}", file=sys.stderr)
+            break
+
+    # Optionally fetch topics per repo (extra API calls; will be slower)
+    if fetch_topics:
+        headers_topics = headers.copy()
+        headers_topics["Accept"] = "application/vnd.github.mercy-preview+json"
+        for repo in results:
+            owner_repo = repo["full_name"]
+            url = f"{GITHUB_API}/repos/{owner_repo}/topics"
+            resp = session.get(url, headers=headers_topics)
+            if resp.status_code == 200:
+                repo_topics = resp.json().get("names", [])
+                repo["topics"] = repo_topics
+            elif resp.status_code == 403 and handle_rate_limit(resp):
+                # retry once after sleeping
+                resp = session.get(url, headers=headers_topics)
+                if resp.status_code == 200:
+                    repo["topics"] = resp.json().get("names", [])
+            else:
+                # leave topics as-is (maybe empty)
+                pass
+            time.sleep(0.2)
+    return results
+
+def save_json(path, results):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(results, f, ensure_ascii=False, indent=2)
+
+def save_csv(path, results):
+    if not results:
+        open(path, "w").close()
+        return
+    keys = list(results[0].keys())
+    with open(path, "w", newline='', encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=keys)
+        writer.writeheader()
+        for r in results:
+            # topics -> semicolon-separated string
+            row = r.copy()
+            row["topics"] = ";".join(row.get("topics") or [])
+            writer.writerow(row)
+
+def parse_args():
+    p = argparse.ArgumentParser(description="Search GitHub repositories by keywords (using GitHub API).")
+    p.add_argument("--keywords", "-k", nargs="+", default=["software", "app"], help="Keywords to search for (default: software app).")
+    p.add_argument("--any", action="store_true", help="Match any keyword (OR). Default is match all (AND).")
+    p.add_argument("--in", dest="in_fields", nargs="+", default=["name","description","readme"], help="Fields to search in: name description readme. Default: name description readme.")
+    p.add_argument("--language", "-l", help="Filter by language (e.g. Python).")
+    p.add_argument("--sort", choices=["stars","forks","help-wanted-issues","updated"], default=None, help="Sort field.")
+    p.add_argument("--order", choices=["desc","asc"], default="desc")
+    p.add_argument("--per-page", type=int, default=100, help="Results per page (max 100).")
+    p.add_argument("--max-pages", type=int, default=10, help="Max pages to fetch. (max_pages * per_page limited by Search API ~1000 results).")
+    p.add_argument("--output", "-o", default="results.json", help="Output file (json or csv by extension).")
+    p.add_argument("--topics", action="store_true", help="Fetch repository topics (extra API calls).")
+    return p.parse_args()
+
+def main():
+    args = parse_args()
+    token = os.environ.get("GITHUB_TOKEN")
+    headers = get_auth_headers(token)
+    qualifiers = []
+    if args.language:
+        qualifiers.append(f"language:{args.language}")
+    # Build the query
+    q = build_query(args.keywords, match_any=args.any, in_fields=args.in_fields, qualifiers=qualifiers)
+    print(f"Query: {q}", file=sys.stderr)
+    results = search_repositories(q, headers, sort=args.sort, order=args.order, per_page=args.per_page, max_pages=args.max_pages, fetch_topics=args.topics)
+    print(f"Found {len(results)} repositories (collected).", file=sys.stderr)
+    out = args.output
+    if out.lower().endswith(".json"):
+        save_json(out, results)
+        print(f"Saved JSON to {out}")
+    elif out.lower().endswith(".csv"):
+        save_csv(out, results)
+        print(f"Saved CSV to {out}")
+    else:
+        # default to json
+        save_json(out, results)
+        print(f"Saved JSON to {out}")
+
+if __name__ == "__main__":
+    main()
