@@ -1,0 +1,226 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+fill_last17_batch1.py
+
+用途：
+  - 对 CSV 文件 "新建 XLSX 工作表.csv" 进行自动随机填充（第 1–100 行）的“末尾 17 列”缺失值。
+  - 填充策略参考已有列内非空样本：优先采样已有数值样本并保持小数位；否则从文本样本采样；若列无样本则在 [0,10) 区间均匀采样（2 位小数）。
+  - 输出更新后的 CSV 与填充日志（CSV）。
+
+用法（在包含 CSV 的目录运行）：
+  python3 fill_last17_batch1.py \
+    --input "新建 XLSX 工作表.csv" \
+    --output "新建 XLSX 工作表_filled_batch1_1-100.csv" \
+    --log "fill_log_batch1_1-100.csv" \
+    --start-row 1 --end-row 100
+
+注意：
+  - 行号以 1 为起点（即脚本默认会处理文件的第 1 行到第 100 行）。
+  - 脚本不会修改原文件，而是写出一个新文件。
+  - 如果你希望处理其它批次（例如 101-200），请调整 --start-row / --end-row 参数。
+"""
+import csv
+import argparse
+import random
+import re
+import math
+from statistics import median
+
+NUM_TARGET_COLS = 17
+
+re_number = re.compile(r'^[+-]?(\d+)(?:\.(\d+))?$')
+
+def is_number_str(s):
+    if s is None:
+        return False
+    s = s.strip()
+    if s == '':
+        return False
+    # remove thousand separators (commas) for detection
+    s2 = s.replace(',', '')
+    # allow scientific notation
+    try:
+        float(s2)
+        return True
+    except:
+        return False
+
+def parse_number(s):
+    if s is None:
+        return None
+    s = s.strip()
+    if s == '':
+        return None
+    s2 = s.replace(',', '')
+    try:
+        return float(s2)
+    except:
+        return None
+
+def decimals_of_string(s):
+    # return number of decimal digits shown in the string (if numeric-like), else 0
+    if s is None:
+        return 0
+    s = s.strip()
+    if s == '':
+        return 0
+    m = re.search(r'\.(\d+)', s)
+    if m:
+        return len(m.group(1))
+    return 0
+
+def format_number(v, decimals):
+    if decimals <= 0:
+        return str(int(round(v)))
+    fmt = "{:." + str(decimals) + "f}"
+    return fmt.format(round(v, decimals))
+
+def collect_column_samples(rows):
+    # rows: list of lists (strings)
+    max_cols = max(len(r) for r in rows)
+    col_samples = [[] for _ in range(max_cols)]
+    for r in rows:
+        for i in range(len(r)):
+            val = r[i].strip()
+            if val != '':
+                col_samples[i].append(val)
+    return col_samples
+
+def choose_sample_for_column(col_samples_i):
+    # returns tuple (type, sample_list)
+    # type: 'numeric' or 'text' or 'none'
+    numeric_samples = []
+    text_samples = []
+    for s in col_samples_i:
+        if is_number_str(s):
+            numeric_samples.append(s)
+        else:
+            text_samples.append(s)
+    if len(numeric_samples) > 0:
+        return ('numeric', numeric_samples)
+    if len(text_samples) > 0:
+        return ('text', text_samples)
+    return ('none', [])
+
+def fill_cell_from_numeric_samples(sample_strs):
+    # sample one string from sample_strs, parse numeric, possibly add small jitter, preserve decimals
+    s = random.choice(sample_strs)
+    d = decimals_of_string(s)
+    v = parse_number(s)
+    if v is None:
+        # fallback to sample without numeric handling
+        return (s, 'sample_text')
+    # with small prob add gaussian multiplicative jitter (mean=1, sd=0.02)
+    if random.random() < 0.2:
+        factor = random.gauss(1.0, 0.02)
+        v = v * factor
+        # keep value reasonable: clamp to 0..10000
+        v = max(min(v, 1e4), -1e4)
+        method = 'numeric_sample_with_jitter'
+    else:
+        method = 'numeric_sample'
+    new_s = format_number(v, d)
+    return (new_s, method + f";sample={s}")
+
+def fill_cell_from_text_samples(sample_strs):
+    s = random.choice(sample_strs)
+    return (s, 'text_sample')
+
+def fallback_random_value():
+    # uniform 0..10, 2 decimals
+    v = random.uniform(0, 10)
+    return (format_number(v, 2), 'fallback_uniform_0_10')
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--input', required=True, help='input CSV filename (原文件)')
+    parser.add_argument('--output', required=True, help='output CSV filename (写出结果)')
+    parser.add_argument('--log', required=True, help='fill log CSV filename')
+    parser.add_argument('--start-row', type=int, default=1, help='1-based start row to process (inclusive)')
+    parser.add_argument('--end-row', type=int, default=100, help='1-based end row to process (inclusive)')
+    args = parser.parse_args()
+
+    infile = args.input
+    outfile = args.output
+    logfile = args.log
+    start_row = args.start_row
+    end_row = args.end_row
+
+    # 读取整个 CSV（支持 BOM）
+    with open(infile, 'r', encoding='utf-8-sig', newline='') as f:
+        reader = csv.reader(f)
+        rows = [row for row in reader]
+
+    if len(rows) == 0:
+        print("输入文件为空。")
+        return
+
+    max_cols = max(len(r) for r in rows)
+    if max_cols < NUM_TARGET_COLS:
+        print(f"警告：表格总列数 {max_cols} 少于 {NUM_TARGET_COLS}，无法定位末尾 {NUM_TARGET_COLS} 列。脚本将把目标列数设为全部列。")
+    # determine target columns: last NUM_TARGET_COLS columns (by index)
+    num_targets = min(NUM_TARGET_COLS, max_cols)
+    target_start_idx = max_cols - num_targets
+    target_indices = list(range(target_start_idx, max_cols))
+
+    # Collect samples for each column across all rows
+    col_samples = collect_column_samples(rows)
+    col_choice = [choose_sample_for_column(col_samples[i]) if i < len(col_samples) else ('none', []) for i in range(max_cols)]
+
+    # Prepare log entries
+    log_entries = []
+    # Process rows in the given index range (1-based)
+    for r_idx_1based in range(start_row, end_row + 1):
+        if r_idx_1based > len(rows):
+            break
+        r_idx0 = r_idx_1based - 1
+        row = rows[r_idx0]
+        # ensure row has max_cols entries
+        if len(row) < max_cols:
+            row.extend([''] * (max_cols - len(row)))
+        # For each target column
+        for ci in target_indices:
+            old_val = row[ci].strip() if ci < len(row) else ''
+            if old_val != '':
+                # already filled, keep existing
+                continue
+            # determine fill approach for this column
+            ctype, samples = col_choice[ci]
+            if ctype == 'numeric':
+                new_val, method = fill_cell_from_numeric_samples(samples)
+            elif ctype == 'text':
+                new_val, method = fill_cell_from_text_samples(samples)
+            else:
+                new_val, method = fallback_random_value()
+            # write back
+            row[ci] = new_val
+            log_entries.append({
+                'row': r_idx_1based,
+                'col_index': ci + 1,   # 1-based
+                'old_value': old_val,
+                'new_value': new_val,
+                'method': method
+            })
+
+    # Write out updated CSV
+    with open(outfile, 'w', encoding='utf-8', newline='') as f:
+        writer = csv.writer(f)
+        for row in rows:
+            writer.writerow(row)
+
+    # Write log CSV
+    with open(logfile, 'w', encoding='utf-8', newline='') as f:
+        fieldnames = ['row', 'col_index', 'old_value', 'new_value', 'method']
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for e in log_entries:
+            writer.writerow(e)
+
+    print(f"已写出结果文件: {outfile}")
+    print(f"已写出填充日志: {logfile}")
+    print(f"共填充单元格数: {len(log_entries)}")
+    print("说明：如果你希望接着处理下一批（101-200），请调整 --start-row/--end-row 参数并重运行脚本。")
+
+if __name__ == '__main__':
+    main()
